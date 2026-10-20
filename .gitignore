@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Never commit message data
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite

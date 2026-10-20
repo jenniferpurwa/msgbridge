@@ -1,0 +1,23 @@
+version = 1
+revision = 5
+requires-python = ">=3.12"
+
+[[package]]
+name = "msgbridge"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "pytypedstream" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pytypedstream", specifier = ">=0.1.0" }]
+
+[[package]]
+name = "pytypedstream"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/47/d2/4632904c21890b1f397e6e9ef823b216f6f0a3a767897b092f592f16b90e/pytypedstream-0.1.0.tar.gz", hash = "sha256:c3b01790e667189966e98fcfeb638cc0541358ea7348745619fe58e3e8c9fd51", size = 84192, upload-time = "2023-06-26T23:43:35.555Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0d/1a/dbbbad9690c24506aec4571bc6613a5625b163b1607777109c9dabdbec07/pytypedstream-0.1.0-py3-none-any.whl", hash = "sha256:499920d4cb8bec8fd9d9cdd4c6312765eb418c398c10371ab1c9c0051104d278", size = 65857, upload-time = "2023-06-26T23:43:32.197Z" },
+]
