@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from msgbridge!")
+"""msgbridge: read-only access to your message history for ChatGPT and Claude."""
