@@ -89,8 +89,9 @@ class Tools:
 
     def _members(self, tid: str, names: dict[int, str], max_shown: int = 3) -> str:
         ids = [r[0] for r in self.db.execute("select person_id from thread_member where thread_id = ?", (tid,))]
-        shown = sorted(names.get(i, "Unknown") for i in ids)
-        extra = len(shown) - max_shown
+        everyone = [names.get(i, "Unknown") for i in ids]
+        shown = sorted(n for n in everyone if n != "WhatsApp user")  # silent members with no name anywhere
+        extra = len(everyone) - min(len(shown), max_shown)
         return ", ".join(shown[:max_shown]) + (f" +{extra}" if extra > 0 else "")
 
     def _describe(self, t, names) -> str:
@@ -192,6 +193,12 @@ class Tools:
         ranked = sorted(best.items(), key=lambda kv: (-kv[1], -self._activity(kv[0])))
         return ranked[:limit]
 
+    def _direct_threads(self, pid: int) -> list[str]:
+        """This person's 1:1 threads with messages (iMessage and/or WhatsApp), most recent first."""
+        return [r[0] for r in self.db.execute(
+            """select id from thread where id in (?, ?) and message_count > 0 order by last_message_at desc""",
+            (f"t_p{pid}", f"t_wp{pid}"))]
+
     def _activity(self, pid: int) -> float:
         row = self.db.execute("""select max(t.last_message_at) from thread t join thread_member tm on tm.thread_id = t.id
                                  where tm.person_id = ?""", (pid,)).fetchone()
@@ -256,10 +263,8 @@ class Tools:
                 if not named:
                     notes.append(f'No group with those members is named like "{query}"; showing their groups by recent activity.')
             if kind != "group" and len(member_ids) == 1 and not group_hits:
-                t = self.db.execute("select id from thread where id = ? and message_count > 0",
-                                    (f"t_p{member_ids[0]}",)).fetchone()
-                if t:
-                    add(t[0], "1:1 thread")
+                for tid in self._direct_threads(member_ids[0]):
+                    add(tid, "1:1 thread")
             for g in candidates:
                 add(g, "has all the members")
         else:
@@ -271,9 +276,8 @@ class Tools:
             top_people = [p for p, _ in people[:3]]
             if kind != "group":
                 for pid in top_people:
-                    t = self.db.execute("select id from thread where id = ? and message_count > 0", (f"t_p{pid}",)).fetchone()
-                    if t:
-                        add(t[0], f"1:1 thread, name matches ({names[pid]})")
+                    for tid in self._direct_threads(pid):
+                        add(tid, f"1:1 thread, name matches ({names[pid]})")
             for g, score in group_hits:
                 add(g, "group name matches")
             if kind != "direct":
@@ -282,7 +286,7 @@ class Tools:
                         add(g, f"{names[pid]} is a member")
             if len([g for g, s in group_hits if s >= 90]) >= 2:
                 notes.append("AMBIGUOUS: yes. Several groups match this name. Ask the user which one they mean.")
-            if top_people and not any(f[0] == f"t_p{top_people[0]}" for f in found) and kind != "group":
+            if top_people and not self._direct_threads(top_people[0]) and kind != "group":
                 recent = [g for g in groups_of([top_people[0]])
                           if (self._thread(g)["last_message_at"] or 0) > time.time() - 30 * 86400]
                 if len(recent) >= 2:
@@ -380,7 +384,8 @@ class Tools:
             pid, problem = self._resolve_person(person)
             if problem:
                 return problem
-            thread_id = f"t_p{pid}"
+            threads = self._direct_threads(pid)
+            thread_id = threads[0] if threads else None
         limit = max(1, min(int(limit or 50), 200))
         good = """is_from_me = 1 and unsent = 0 and body not like '[%'
                   and length(body) - length(replace(body, ' ', '')) >= 2"""
@@ -451,7 +456,7 @@ class Tools:
             t = self._thread(r["thread_id"])
             line = self._render([r], names, ids=True)[0]
             mid, rest = line.split(" ", 1)
-            lines.append(f"{mid} · {self._describe(t, names)} · {_short(rest, 400)}")
+            lines.append(f"{mid} · {t['app']} {self._describe(t, names)} · {_short(rest, 400)}")
         return "\n".join(lines + [DATA_CLOSE])
 
     def get_message_context(self, message_id: str, before: int = 15, after: int = 15) -> str:
@@ -529,10 +534,10 @@ class Tools:
             return stats.setdefault(pid, {
                 "n": Counter(), "words": Counter(), "q": Counter(), "start": Counter(), "reach": Counter(),
                 "reply": {"me": [], "them": []}, "react": Counter(), "days": set(), "months": {},
-                "group_msgs": 0, "groups": 0})
+                "group_msgs": 0, "groups": 0, "apps": set(), "by_app": Counter()})
 
         rows = self.db.execute("""select thread_id, is_from_me, sent_at, body from message
-                                  where sent_at >= ? and sent_at < ? and thread_id like 't_p%'
+                                  where sent_at >= ? and sent_at < ? and (thread_id like 't_p%' or thread_id like 't_wp%')
                                   order by thread_id, sent_at""", (lo, hi))
         total = 0
         for tid, group in groupby(rows, key=lambda r: r[0]):
@@ -540,10 +545,12 @@ class Tools:
             if pid is None or (wanted and pid not in wanted):
                 continue
             s, prev = stat(pid), None
+            s["apps"].add(tid)
             for _, me, ts, body in group:
                 total += 1
                 side = "me" if me else "them"
                 s["n"][side] += 1
+                s["by_app"]["WhatsApp" if tid.startswith("t_wp") else "iMessage"] += 1
                 s["words"][side] += len(body.split())
                 s["q"][side] += "?" in body
                 when = datetime.fromtimestamp(ts)
@@ -561,7 +568,7 @@ class Tools:
         for me, tid, n in self.db.execute("""
                 select r.is_from_me, m.thread_id, count(*) from reaction r join message m on m.guid = r.target_guid
                 where r.removed = 0 and r.sent_at >= ? and r.sent_at < ? and m.is_from_me != r.is_from_me
-                  and m.thread_id like 't_p%' group by 1, 2""", (lo, hi)):
+                  and (m.thread_id like 't_p%' or m.thread_id like 't_wp%') group by 1, 2""", (lo, hi)):
             pid = direct.get(tid)
             if pid in stats:
                 stats[pid]["react"]["me" if me else "them"] += n
@@ -596,11 +603,13 @@ class Tools:
         for i, (pid, s) in enumerate(ranked[:limit], 1):
             n = s["n"]
             tot = n["me"] + n["them"]
-            has_direct = f"t_p{pid}" in direct
-            parts = [f"{i}. {names.get(pid, 'Unknown')}" + (f" (t_p{pid})" if has_direct else "")]
+            threads = [t for t in (f"t_p{pid}", f"t_wp{pid}") if t in direct and t in s["apps"]]
+            parts = [f"{i}. {names.get(pid, 'Unknown')}" + (f" ({', '.join(threads)})" if threads else "")]
             if tot:
                 parts += [
-                    f"1:1 messages {tot:,} (them {n['them']:,} / me {n['me']:,}, they send {100 * n['them'] / tot:.0f}%)",
+                    f"1:1 messages {tot:,} (them {n['them']:,} / me {n['me']:,}, they send {100 * n['them'] / tot:.0f}%"
+                    + (f"; iMessage {s['by_app']['iMessage']:,} + WhatsApp {s['by_app']['WhatsApp']:,}"
+                       if len(s["by_app"]) > 1 else f"; {next(iter(s['by_app']))}") + ")",
                     f"active days {len(s['days'])}",
                     f"conversations started {s['start']['them']} / {s['start']['me']}",
                     f"reach-outs after 7+ days {s['reach']['them']} / {s['reach']['me']}",
@@ -622,17 +631,18 @@ class Tools:
     def get_status(self) -> str:
         self._fresh()
         db = self.db
-        n_msg = db.execute("select count(*) from message").fetchone()[0]
-        kinds = dict(db.execute("select kind, count(*) from thread where message_count > 0 group by kind").fetchall())
-        first, last = db.execute("select min(sent_at), max(sent_at) from message").fetchone()
+        lines = ["STATUS: msgbridge (read-only)"]
+        for app, label in (("iMessage", "iMessage/SMS/RCS"), ("WhatsApp", "WhatsApp")):
+            n_msg, first, last = db.execute("""select count(*), min(m.sent_at), max(m.sent_at) from message m
+                                               join thread t on t.id = m.thread_id where t.app = ?""", (app,)).fetchone()
+            kinds = dict(db.execute("select kind, count(*) from thread where app = ? and message_count > 0 group by kind",
+                                    (app,)).fetchall())
+            if not n_msg:
+                lines.append(f"{label}: not connected")
+                continue
+            lines.append(f"{label}: {n_msg:,} messages, {kinds.get('direct', 0):,} 1:1 threads, "
+                         f"{kinds.get('group', 0):,} groups, {fmt_day(first)} → {fmt_day(last)}")
         n_react = db.execute("select count(*) from reaction").fetchone()[0]
         n_people = db.execute("select count(*) from person where from_contacts = 1").fetchone()[0]
-        return "\n".join([
-            "STATUS: msgbridge (read-only)",
-            f"iMessage/SMS/RCS: {n_msg:,} messages, {n_react:,} reactions, "
-            f"{kinds.get('direct', 0):,} 1:1 threads, {kinds.get('group', 0):,} groups",
-            f"History: {fmt_day(first) if first else '-'} → {fmt_day(last) if last else '-'}",
-            f"Contacts matched: {n_people:,}",
-            "WhatsApp: not connected yet",
-            self._freshness(),
-        ])
+        lines += [f"Reactions: {n_react:,} · contacts matched: {n_people:,}", self._freshness()]
+        return "\n".join(lines)

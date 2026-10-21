@@ -12,7 +12,8 @@ from .fixture import CONTACTS, build
 @pytest.fixture
 def env(tmp_path):
     fake = build(tmp_path / "chat.db")
-    index = Index(Config(index_path=tmp_path / "index.db", chat_db=fake.path, contacts=CONTACTS))
+    index = Index(Config(index_path=tmp_path / "index.db", chat_db=fake.path, contacts=CONTACTS,
+                         wa_dir=tmp_path / "no-whatsapp"))
     index.rebuild()
     return fake, index, Tools(index, auto_sync=False)
 
