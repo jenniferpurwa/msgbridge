@@ -1,15 +1,23 @@
 """MCP server exposing the eight read-only tools.
 
-Runs over stdio for Claude Desktop. The tool descriptions carry the behavior
+Runs over stdio for Claude Desktop, or over HTTPS-behind-a-tunnel with OAuth for
+ChatGPT (`msgbridge serve-http`). The tool descriptions carry the behavior
 rules from the spec (thread selection, paging, citing sources), because they
 are what the model reads on every call.
 """
+import os
 import threading
+from pathlib import Path
 from typing import Literal
 
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse
 
+from .auth import SCOPES as AUTH_SCOPES
 from .index import Config, Index
 from .tools import Tools
 
@@ -35,8 +43,8 @@ msgbridge gives read-only access to the user's own iMessage, SMS and RCS history
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 
 
-def build_server(tools: Tools) -> MCPServer:
-    server = MCPServer("msgbridge", instructions=INSTRUCTIONS, version="0.1.0")
+def build_server(tools: Tools, **server_options) -> MCPServer:
+    server = MCPServer("msgbridge", instructions=INSTRUCTIONS, version="0.1.0", **server_options)
     lock = threading.Lock()  # one tool call at a time on the shared SQLite connection
 
     @server.tool(annotations=READ_ONLY, description="""\
@@ -119,6 +127,63 @@ wait first. Businesses and short codes are excluded. Groups only if include_grou
 def main():
     index = Index(Config.from_env())
     build_server(Tools(index)).run("stdio")
+
+
+DATA_DIR = Path.home() / "Library/Application Support/MsgBridge"
+
+
+def _public_url() -> str:
+    """Your tunnel's address, from MSGBRIDGE_PUBLIC_URL or the public_url file in DATA_DIR."""
+    if url := os.environ.get("MSGBRIDGE_PUBLIC_URL"):
+        return url.strip().rstrip("/")
+    path = DATA_DIR / "public_url"
+    return path.read_text().strip().rstrip("/") if path.exists() else ""
+
+
+PUBLIC_URL = _public_url()
+PORT = int(os.environ.get("MSGBRIDGE_PORT", "8765"))
+
+
+def build_http_server(tools: Tools, auth) -> tuple[MCPServer, dict]:
+    """The server plus the keyword arguments for server.run("streamable-http", ...)."""
+    host = PUBLIC_URL.split("://", 1)[1]
+    server = build_server(
+        tools,
+        auth_server_provider=auth,
+        auth=AuthSettings(
+            issuer_url=PUBLIC_URL,
+            resource_server_url=f"{PUBLIC_URL}/mcp",
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True, valid_scopes=AUTH_SCOPES, default_scopes=AUTH_SCOPES),
+            revocation_options=RevocationOptions(enabled=True),
+            required_scopes=["messages:read"]))
+
+    @server.custom_route("/login", methods=["GET", "POST"])
+    async def login(request: Request):
+        if request.method == "GET":
+            return HTMLResponse(auth.login_page(request.query_params.get("request", "")))
+        form = await request.form()
+        request_id = str(form.get("request", ""))
+        redirect, error = auth.complete_login(request_id, str(form.get("password", "")), str(form.get("code", "")))
+        if redirect:
+            return RedirectResponse(redirect, status_code=302)
+        return HTMLResponse(auth.login_page(request_id, error), status_code=401)
+
+    run_options = dict(
+        host="127.0.0.1", port=PORT, streamable_http_path="/mcp", stateless_http=True, json_response=True,
+        transport_security=TransportSecuritySettings(
+            allowed_hosts=[host, f"127.0.0.1:{PORT}", f"localhost:{PORT}"],
+            allowed_origins=[PUBLIC_URL, "https://chatgpt.com", "https://chat.openai.com", "https://claude.ai"]))
+    return server, run_options
+
+
+def serve_http():
+    from .auth import Auth
+    if not PUBLIC_URL:
+        raise SystemExit(f"msgbridge: set MSGBRIDGE_PUBLIC_URL or write your tunnel's https URL to {DATA_DIR / 'public_url'}")
+    auth = Auth(DATA_DIR / "auth.db", DATA_DIR / "credentials.json", PUBLIC_URL)
+    server, run_options = build_http_server(Tools(Index(Config.from_env())), auth)
+    server.run("streamable-http", **run_options)
 
 
 if __name__ == "__main__":
