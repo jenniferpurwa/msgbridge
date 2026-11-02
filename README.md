@@ -8,6 +8,8 @@ without copying and pasting conversations.
 It never sends messages. Everything runs on your Mac: msgbridge builds a local index from
 the Messages and WhatsApp databases, and the AI app queries it through eight tools.
 
+Design docs: [PRD](docs/PRD.md) · [Tech design](docs/tech-design.md)
+
 ## Tools
 
 | Tool | What it does |
