@@ -199,7 +199,7 @@ def test_relationship_stats_counts_everything(env):
     assert "1:1 messages 7 (them 4 / me 3" in lee
     assert "reactions 1 / 0" in lee                 # Stephen hearted my message
     assert "conversations started 3 / 0" in lee     # gaps of ~10 h and ~29 h start new conversations, both by Stephen
-    assert "their group messages 3 in 2 shared active group(s)" in lee
+    assert "their group messages 5 in 3 shared active group(s)" in lee
     park = next(l for l in out.splitlines() if "Stephen Park" in l)
     assert "they send 100%" in park
     only = tools.get_relationship_stats(since="2020-01-01", people=["Maya"])

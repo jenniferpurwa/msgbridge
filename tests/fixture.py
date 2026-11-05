@@ -13,7 +13,7 @@ from msgbridge.imessage import from_unix
 SCHEMA = """
 create table handle(ROWID integer primary key, id text, service text);
 create table chat(ROWID integer primary key, guid text, style integer, chat_identifier text,
-                  display_name text, service_name text);
+                  display_name text, service_name text, group_id text, original_group_id text);
 create table chat_handle_join(chat_id integer, handle_id integer);
 create table chat_message_join(chat_id integer, message_id integer);
 create table attachment(ROWID integer primary key, mime_type text, uti text, transfer_name text,
@@ -25,7 +25,8 @@ create table message(ROWID integer primary key, guid text, text text, attributed
     associated_message_guid text, associated_message_type integer default 0, associated_message_emoji text,
     thread_originator_guid text, date_edited integer default 0, date_retracted integer default 0,
     message_summary_info blob, balloon_bundle_id text, payload_data blob,
-    cache_has_attachments integer default 0, is_audio_message integer default 0, service text default 'iMessage');
+    cache_has_attachments integer default 0, is_audio_message integer default 0, service text default 'iMessage',
+    group_action_type integer default 0, other_handle integer default 0);
 """
 
 CONTACTS = [
@@ -42,7 +43,11 @@ CHATS = {1: (45, None, [1]), 2: (45, None, [1]),           # Stephen Lee on iMes
          3: (45, None, [2]), 4: (45, None, [3]),            # Stephen Park, Maya
          5: (43, "Pickleball crew", [1, 3, 4]),             # named group
          6: (43, None, [1, 5, 4, 2]),                       # unnamed group
-         7: (45, None, [6]), 8: (43, "Bali trip", [3, 4])}  # bank short code, second named group
+         7: (45, None, [6]), 8: (43, "Bali trip", [3, 4]),  # bank short code, second named group
+         9: (43, "Brunch club", [1, 3]),                    # iMessage group...
+         10: (43, "Brunch club", [1, 5, 2]),                # ...continued as RCS after Stephen Park joined
+         11: (43, None, [2])}                               # linked, but different people: stays separate
+GROUP_IDS = {9: ("G-brunch-1", None), 10: ("G-brunch-2", "G-brunch-1"), 11: ("G-other", "G-brunch-1")}
 
 DAY = 86400
 
@@ -54,7 +59,9 @@ class FakeChatDB:
         self.con.executescript(SCHEMA)
         self.con.executemany("insert into handle values (?, ?, 'iMessage')", HANDLES.items())
         for cid, (style, name, hids) in CHATS.items():
-            self.con.execute("insert into chat values (?, ?, ?, ?, ?, 'iMessage')", (cid, f"chat{cid}", style, f"c{cid}", name))
+            gid, orig = GROUP_IDS.get(cid, (None, None))
+            self.con.execute("insert into chat values (?, ?, ?, ?, ?, 'iMessage', ?, ?)",
+                             (cid, f"chat{cid}", style, f"c{cid}", name, gid, orig))
             self.con.executemany("insert into chat_handle_join values (?, ?)", [(cid, h) for h in hids])
         self.next_rowid = 1
         self.now = time.time()
@@ -110,6 +117,15 @@ def build(path: Path) -> FakeChatDB:
     db.add(8, "booking the villa in Ubud", me=True, days_ago=19)
     # Bank short code with a one-time code
     db.add(7, "Your verification code is 482913. Do not share it.", handle=6, days_ago=0.5)
+    # Brunch club: one group in two linked chats, with a recorded add and a later removal
+    db.add(9, "brunch sunday?", handle=1, days_ago=10)
+    db.add(9, "", handle=0, me=True, days_ago=9.5, item_type=1, group_action_type=0, other_handle=4)  # I add Alex
+    db.add(9, "yes!", handle=3, days_ago=9)
+    db.add(10, "welcome stephen p!", handle=1, days_ago=8, service="RCS")
+    db.add(9, "still getting some here", handle=3, days_ago=7.5)
+    db.add(10, "see you all at 11", handle=2, days_ago=7, service="RCS")
+    db.add(9, "", handle=0, me=True, days_ago=6, item_type=1, group_action_type=1, other_handle=4)   # I remove Alex
+    db.add(11, "side chat", handle=2, days_ago=5)
     # Edge cases the importer must skip or attach
     db.add(None, "message with no chat row", handle=4, days_ago=7)       # orphan -> Alex 1:1
     db.add(5, "", handle=3, days_ago=1.5, item_type=2)                    # group rename event

@@ -136,7 +136,14 @@ def read_handles(con) -> dict[int, str]:
 
 
 def read_chats(con) -> list[sqlite3.Row]:
-    return con.execute("select ROWID, guid, style, display_name from chat").fetchall()
+    return con.execute("select ROWID, guid, style, display_name, group_id, original_group_id from chat").fetchall()
+
+
+def chat_first_dates(con) -> dict[int, float]:
+    """chat ROWID -> unix time of its first message."""
+    return {r[0]: to_unix(r[1]) for r in con.execute("""
+        select j.chat_id, min(m.date) from chat_message_join j join message m on m.ROWID = j.message_id
+        group by j.chat_id""")}
 
 
 def read_chat_handles(con) -> dict[int, list[int]]:
@@ -154,6 +161,7 @@ def read_messages(con, min_rowid: int = 0, since_apple: int | None = None):
                m.item_type, m.associated_message_guid, m.associated_message_type,
                m.associated_message_emoji, m.thread_originator_guid, m.date_edited,
                m.date_retracted, m.balloon_bundle_id, m.is_audio_message, m.service,
+               m.group_action_type, m.other_handle,
                (select min(j.chat_id) from chat_message_join j where j.message_id = m.ROWID) as chat_id
         from message m where {where} order by m.ROWID""", params).fetchall()
     if not rows:
@@ -184,8 +192,12 @@ def read_messages(con, min_rowid: int = 0, since_apple: int | None = None):
             yield {**base, "type": "reaction", "target_guid": strip_guid(r["associated_message_guid"]),
                    "emoji": emoji or "a reaction", "removed": assoc >= 3000}
             continue
+        if r["item_type"] == 1 and r["other_handle"]:
+            yield {**base, "type": "member", "action": "left" if r["group_action_type"] else "joined",
+                   "other_handle": r["other_handle"]}
+            continue
         if r["item_type"]:
-            continue  # group renames, members joining or leaving
+            continue  # group renames and other notices
         if r["date_retracted"]:
             body = "[unsent message]"
         else:

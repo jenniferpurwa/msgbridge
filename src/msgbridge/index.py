@@ -54,7 +54,12 @@ create trigger if not exists message_au after update of body on message begin
     insert into message_fts(rowid, body) values (new.src_rowid, new.body); end;
 create table if not exists meta(key text primary key, value text);
 create table if not exists wa_jid(jid text primary key, person_id integer not null);
+create table if not exists member_event(
+    id integer primary key, thread_id text not null, person_id integer not null, action text not null,
+    actor_id integer, actor_is_me integer not null default 0, at real not null, inferred integer not null default 0);
+create index if not exists member_event_thread on member_event(thread_id, at);
 """
+MERGE_OVERLAP = 0.5  # linked group chats merge when this share of the smaller member list is shared
 
 
 @dataclass
@@ -104,7 +109,7 @@ class Index:
 
     def _reset(self):
         for table in ("person", "identity", "handle_map", "thread", "thread_source",
-                      "thread_member", "message", "reaction", "meta", "wa_jid"):
+                      "thread_member", "message", "reaction", "meta", "wa_jid", "member_event"):
             self.db.execute(f"delete from {table}")
         self.db.execute("insert into message_fts(message_fts) values ('rebuild')")
         self._load_contacts()
@@ -151,25 +156,64 @@ class Index:
         for hid, h in handles.items():
             self._person_for_handle(hid, h)
         chat_handles = imessage.read_chat_handles(src)
-        known = {r[0] for r in self.db.execute("select chat_rowid from thread_source")}
-        for chat in imessage.read_chats(src):
+        known = dict(self.db.execute("select chat_rowid, thread_id from thread_source").fetchall())
+        chats = imessage.read_chats(src)
+        members = {c["ROWID"]: [self._person_for_handle(h, handles[h])
+                                for h in chat_handles.get(c["ROWID"], []) if h in handles] for c in chats}
+        self._chat_people = {chat: {p for p, _ in people} for chat, people in members.items()}
+        groups = [c for c in chats if c["style"] == imessage.GROUP_STYLE]
+        linked = self._linked_groups(groups, members)
+        for chat in chats:
             if chat["ROWID"] in known:
                 continue
-            members = [self._person_for_handle(h, handles[h])
-                       for h in chat_handles.get(chat["ROWID"], []) if h in handles]
             if chat["style"] == imessage.GROUP_STYLE:
-                tid = f"t_g{chat['ROWID']}"
-                name = chat["display_name"] or None
+                family = linked[chat["ROWID"]]
+                tid = next((known[c] for c in family if c in known), f"t_g{min(family)}")
+                names = [c["display_name"] for c in sorted(groups, key=lambda c: -c["ROWID"])
+                         if c["ROWID"] in family and c["display_name"]]
+                name = names[0] if names else None  # the most recent chat's name
                 self.db.execute("insert or ignore into thread(id, app, kind, name, label) values (?, 'iMessage', 'group', ?, ?)",
                                 (tid, name, name or "group"))
-            elif members:
-                pid, business = members[0]
+            elif members[chat["ROWID"]]:
+                pid, business = members[chat["ROWID"]][0]
                 tid = self._direct_thread(pid, business)
             else:
                 continue
+            known[chat["ROWID"]] = tid
             self.db.execute("insert into thread_source values (?, ?)", (chat["ROWID"], tid))
-            for pid, _ in members:
+            for pid, _ in members[chat["ROWID"]]:
                 self.db.execute("insert or ignore into thread_member values (?, ?)", (tid, pid))
+
+    @staticmethod
+    def _linked_groups(groups, members) -> dict[int, set[int]]:
+        """Group chats that are one group: Messages starts a new chat (e.g. iMessage -> RCS) when members
+        change, and records the link in group_id / original_group_id. Linked chats merge only when at least
+        MERGE_OVERLAP of the smaller member list is the same people, so a deliberate subgroup stays apart."""
+        parent = {c["ROWID"]: c["ROWID"] for c in groups}
+
+        def root(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        by_group_id: dict[str, list[int]] = {}
+        for c in groups:
+            if c["group_id"]:
+                by_group_id.setdefault(c["group_id"], []).append(c["ROWID"])
+        for c in groups:
+            for key in (c["group_id"], c["original_group_id"]):
+                for other in by_group_id.get(key or "", []):
+                    if other == c["ROWID"]:
+                        continue
+                    a = {p for p, _ in members[c["ROWID"]]}
+                    b = {p for p, _ in members[other]}
+                    if a and b and len(a & b) / min(len(a), len(b)) >= MERGE_OVERLAP:
+                        parent[root(c["ROWID"])] = root(other)
+        families: dict[int, set[int]] = {}
+        for c in groups:
+            families.setdefault(root(c["ROWID"]), set()).add(c["ROWID"])
+        return {c: families[root(c)] for c in parent}
 
     def _direct_thread(self, pid: int, business: bool, app: str = "iMessage") -> str:
         """iMessage, SMS and RCS chats with one person share one 1:1 thread; WhatsApp gets its own."""
@@ -207,6 +251,13 @@ class Index:
                             counts["skipped_no_thread"] += 1
                             continue
                         sender_id = None if m["is_from_me"] else sender
+                        if m["type"] == "member":
+                            who = handle_person.get(m["other_handle"], (None, False))[0]
+                            if who:
+                                self.db.execute("insert or replace into member_event values (?, ?, ?, ?, ?, ?, ?, 0)",
+                                                (m["rowid"], tid, who, m["action"], sender_id, int(m["is_from_me"]),
+                                                 m["sent_at"]))
+                            continue
                         if m["type"] == "reaction":
                             self.db.execute("""insert or replace into reaction values (?, ?, ?, ?, ?, ?, ?)""",
                                             (m["rowid"], m["target_guid"], sender_id, int(m["is_from_me"]),
@@ -222,12 +273,34 @@ class Index:
                              m["reply_to_guid"], m["service"]))
                         counts["messages"] += 1
                 self.set_meta("last_rowid", max_rowid)
+                self._infer_joins(imessage.chat_first_dates(src))
                 self._import_whatsapp(full, counts)
                 self._update_thread_stats()
                 self.set_meta("last_sync_at", time.time())
         finally:
             src.close()
         return counts
+
+    def _infer_joins(self, first_dates: dict[int, float]) -> None:
+        """Someone in a later chat of a merged group, but in none of the earlier ones, joined when that chat
+        started, unless Messages recorded the join itself."""
+        self.db.execute("delete from member_event where inferred = 1")
+        merged = self.db.execute("""select thread_id from thread_source where thread_id like 't_g%'
+                                    group by thread_id having count(*) > 1""").fetchall()
+        for (tid,) in merged:
+            chats = sorted((first_dates.get(c, float("inf")), c) for (c,) in self.db.execute(
+                "select chat_rowid from thread_source where thread_id = ?", (tid,)))
+            seen: set[int] = set()
+            for start, chat in chats:
+                people = self._chat_people.get(chat, set())
+                if seen and start != float("inf"):
+                    for pid in people - seen:
+                        recorded = self.db.execute("""select 1 from member_event where thread_id = ? and person_id = ?
+                                                      and action = 'joined' and inferred = 0""", (tid, pid)).fetchone()
+                        if not recorded:
+                            self.db.execute("""insert into member_event(thread_id, person_id, action, at, inferred)
+                                               values (?, ?, 'joined', ?, 1)""", (tid, pid, start))
+                seen |= people
 
     # -- WhatsApp -----------------------------------------------------------------
     def _wa_person(self, jid: str, name: str, lid_phones: dict, push: dict) -> int:

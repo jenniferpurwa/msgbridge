@@ -103,7 +103,8 @@ class Tools:
     def _source_header(self, t, names) -> str:
         return f"SOURCE: {t['app']} · {self._describe(t, names)} · thread {t['id']}"
 
-    def _render(self, rows, names, ids: bool = False, mark: int | None = None, compact: bool = False) -> list[str]:
+    def _render(self, rows, names, ids: bool = False, mark: int | None = None, compact: bool = False,
+                events: list[tuple[float, str]] = ()) -> list[str]:
         guids = [r["guid"] for r in rows]
         reactions: dict[str, dict] = {}
         for i in range(0, len(guids), 900):
@@ -128,17 +129,28 @@ class Tools:
                 quotes[q["guid"]] = f'{who}: "{_short(q["body"], 40 if compact else 60)}"'
 
         lines, day = [], None
+        pending = sorted(events)
+
+        def stamp(ts: float) -> str:
+            nonlocal day
+            if not compact:
+                return f"[{fmt_time(ts)}]"
+            # One date header per day, then HH:MM lines: about a fifth fewer tokens.
+            this_day = datetime.fromtimestamp(ts).strftime("%a %b %-d, %Y")
+            if this_day != day:
+                lines.append(f"== {this_day}")
+                day = this_day
+            return datetime.fromtimestamp(ts).strftime("%H:%M")
+
+        def flush(until: float):
+            while pending and pending[0][0] <= until:
+                ts, text = pending.pop(0)
+                lines.append(f"{stamp(ts)} [{text}]")
+
         for r in rows:
+            flush(r["sent_at"])
             who = "Me" if r["is_from_me"] else names.get(r["sender_id"], "Unknown")
-            if compact:
-                # One date header per day, then HH:MM lines: about a fifth fewer tokens.
-                this_day = datetime.fromtimestamp(r["sent_at"]).strftime("%a %b %-d, %Y")
-                if this_day != day:
-                    lines.append(f"== {this_day}")
-                    day = this_day
-                head = f"{datetime.fromtimestamp(r['sent_at']).strftime('%H:%M')} {who}"
-            else:
-                head = f"[{fmt_time(r['sent_at'])}] {who}"
+            head = f"{stamp(r['sent_at'])} {who}"
             if r["reply_to_guid"]:
                 head += f" (replying to {quotes[r['reply_to_guid']]})" if r["reply_to_guid"] in quotes else " (replying)"
             body = r["body"] + (" (edited)" if r["edited"] else "")
@@ -150,11 +162,30 @@ class Tools:
             if mark is not None:
                 line = (">> " if r["src_rowid"] == mark else "   ") + line
             lines.append(line)
+        flush(float("inf"))
         return lines
+
+    def _member_events(self, tid: str, names: dict[int, str], lo: float = 0, hi: float = float("inf")):
+        """(time, text) for joins and departures in a group thread between lo and hi."""
+        out = []
+        for e in self.db.execute("select * from member_event where thread_id = ? and at >= ? and at <= ? order by at",
+                                 (tid, lo, hi)):
+            who = names.get(e["person_id"], "Someone")
+            actor = "Me" if e["actor_is_me"] else names.get(e["actor_id"]) if e["actor_id"] else None
+            if e["action"] == "joined":
+                text = f"{who} joined the group" + (f", added by {actor}" if actor and actor != who else "")
+                if e["inferred"]:
+                    text += " (first seen when Messages started a new copy of the group chat)"
+            else:
+                text = f"{actor} removed {who}" if actor and actor != who else f"{who} left the group"
+            out.append((e["at"], text))
+        return out
 
     def _short_names(self, tid: str, names: dict[int, str]) -> dict[int, str]:
         """First names inside one thread, unless two members share a first name."""
-        ids = [r[0] for r in self.db.execute("select person_id from thread_member where thread_id = ?", (tid,))]
+        ids = [r[0] for r in self.db.execute("""select person_id from thread_member where thread_id = ?
+                                                 union select person_id from member_event where thread_id = ?""",
+                                              (tid, tid))]  # past members too
         firsts = {i: names.get(i, "Unknown").split(" ")[0] for i in ids}
         counts = {}
         for f in firsts.values():
@@ -375,7 +406,17 @@ class Tools:
         header.append(self._freshness())
         compact = format != "full"
         shown = self._short_names(thread_id, names) if compact else names
-        return "\n".join(header + [DATA_OPEN] + self._render(rows, shown, compact=compact) + [DATA_CLOSE])
+        events = []
+        if t["kind"] == "group":
+            changes = self._member_events(thread_id, names)
+            if changes:
+                header.insert(-1, "MEMBER CHANGES: " + "; ".join(
+                    f"{text.split(' (first seen')[0]} ({fmt_day(ts)})" for ts, text in changes[-10:]))
+            lo = 0 if not older else rows[0]["sent_at"]
+            hi = float("inf") if newer <= 0 else rows[-1]["sent_at"]
+            events = self._member_events(thread_id, shown, lo, hi)
+        return "\n".join(header + [DATA_OPEN] + self._render(rows, shown, compact=compact, events=events)
+                         + [DATA_CLOSE])
 
     def get_style_examples(self, thread_id: str | None = None, person: str | None = None, limit: int = 50) -> str:
         self._fresh()
