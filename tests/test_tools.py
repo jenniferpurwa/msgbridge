@@ -43,7 +43,7 @@ def test_placeholders_replies_reactions_edits(env):
     assert "Stephen Lee: [photo]" in out
     assert "see you there (edited)" in out
     assert "Me: [unsent message]" in out
-    assert "check this [link: nytimes.com]" in out
+    assert "check this https://www.nytimes.com/2026/10/bali-guide" in out
     assert "￼" not in out
 
 

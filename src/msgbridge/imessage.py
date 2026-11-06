@@ -6,16 +6,16 @@ readable placeholders, reactions split out, edits and unsends flagged.
 import re
 import sqlite3
 from pathlib import Path
-from urllib.parse import urlparse
 
 import typedstream
+
+from .links import clean_text
 
 APPLE_EPOCH = 978307200  # 2001-01-01 UTC in Unix seconds
 OBJECT_REPLACEMENT = "￼"
 GROUP_STYLE, DIRECT_STYLE = 43, 45
 
 TAPBACKS = {0: "❤️", 1: "👍", 2: "👎", 3: "😂", 4: "‼️", 5: "❓", 7: "[sticker]"}
-URL_RE = re.compile(r"https?://\S+")
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -107,16 +107,11 @@ def attachment_placeholder(mime, uti, is_sticker, is_audio_message, name) -> str
     return f"[file: {name}]" if name else "[file]"
 
 
-def _link_placeholder(url: str) -> str:
-    host = urlparse(url).netloc.lower().removeprefix("www.")
-    return f"[link: {host}]" if host else "[link]"
-
-
 def build_body(text: str, attachments: list[str], balloon: str | None) -> str:
-    """Message text with attachments and links turned into short placeholders."""
-    body = text.replace(OBJECT_REPLACEMENT, " ").strip()
+    """Message text with attachments as placeholders and links cleaned (see links.py)."""
+    body = clean_text(text.replace(OBJECT_REPLACEMENT, " ").strip())
     if balloon and "URLBalloonProvider" in balloon:
-        body = URL_RE.sub(lambda m: _link_placeholder(m.group(0)), body) or "[link]"
+        body = body or "[link]"
     elif balloon and not body:
         body = "[app message]"
     parts = [body] if body else []

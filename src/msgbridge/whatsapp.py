@@ -7,9 +7,9 @@ against the real database without printing any content.
 import re
 import sqlite3
 from pathlib import Path
-from urllib.parse import urlparse
 
-from .imessage import APPLE_EPOCH, URL_RE
+from .imessage import APPLE_EPOCH
+from .links import clean_text
 
 DEFAULT_DIR = Path.home() / "Library/Group Containers/group.net.whatsapp.WhatsApp.shared"
 
@@ -110,14 +110,10 @@ def _duration(seconds) -> str:
     return f" {s // 60}:{s % 60:02d}" if s else ""
 
 
-def _host(url: str) -> str:
-    return urlparse(url).netloc.lower().removeprefix("www.")
-
-
 def build_body(mtype: int, text: str | None, title: str | None, duration, media_url_text: str | None = None) -> str | None:
     """Readable text for one message, or None for events that are not messages."""
-    text = (text or "").strip()
-    title = (title or "").strip()
+    text = clean_text((text or "").strip())
+    title = clean_text((title or "").strip())
     if mtype in SYSTEM_TYPES:
         return None
     if mtype == 0:
@@ -133,11 +129,7 @@ def build_body(mtype: int, text: str | None, title: str | None, duration, media_
     if mtype == 5:
         return "[location]"
     if mtype == 7:
-        urls = URL_RE.findall(text)
-        host = _host(urls[0]) if urls else ""
-        label = f"[link: {host}" + (f" – {title}" if title else "") + "]" if host else "[link]"
-        rest = URL_RE.sub("", text).strip()
-        return f"{rest} {label}".strip()
+        return ((text or "[link]") + (f" [link preview: {title}]" if title else "")).strip()
     if mtype == 8:
         return "[document]" + (f" {title}" if title else "")
     if mtype == 11:

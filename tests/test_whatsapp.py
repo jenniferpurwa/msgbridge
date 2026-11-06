@@ -43,7 +43,7 @@ def test_placeholders_replies_and_reactions(env):
     assert "are you coming to the hike on sunday? (Me reacted 👍)" in out
     assert 'Me (replying to Stephen Lee: "are you coming to the hike on sunday?"): yes! what time' in out
     assert "[voice note 0:42]" in out
-    assert "[link: alltrails.com – Mission Peak Trail]" in out
+    assert "https://www.alltrails.com/trail/mission-peak [link preview: Mission Peak Trail]" in out
     assert "[WhatsApp item]" in out
 
 
